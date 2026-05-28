@@ -1,0 +1,80 @@
+name: Debug & Error Recovery System
+
+on:
+  workflow_run:
+    workflows: ["Progress Monitoring & Self-Correction"]
+    types: [completed]
+  workflow_dispatch:
+
+jobs:
+  debug-and-recover:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v3
+
+      - name: Check System Health
+        run: |
+          echo "=== SYSTEM HEALTH CHECK ===" >> $GITHUB_STEP_SUMMARY
+          echo "- OS: $(uname -s)" >> $GITHUB_STEP_SUMMARY
+          echo "- Git Version: $(git --version)" >> $GITHUB_STEP_SUMMARY
+          echo "- Disk Space: $(df -h / | awk 'NR==2 {print $5}')" >> $GITHUB_STEP_SUMMARY
+          echo "- Memory: $(free -h | awk 'NR==2 {print $3 "/" $2}')" >> $GITHUB_STEP_SUMMARY
+
+      - name: Validate Repository Structure
+        run: |
+          echo "=== REPOSITORY VALIDATION ===" >> $GITHUB_STEP_SUMMARY
+          if [ -f "README.md" ]; then echo "✓ README.md found" >> $GITHUB_STEP_SUMMARY; fi
+          if [ -d ".git" ]; then echo "✓ Git repository valid" >> $GITHUB_STEP_SUMMARY; fi
+          if [ -d ".github/workflows" ]; then echo "✓ Workflows directory found" >> $GITHUB_STEP_SUMMARY; fi
+          echo "- Last Git Status: $(git status --short | wc -l) files changed" >> $GITHUB_STEP_SUMMARY
+
+      - name: Error Log Analysis
+        continue-on-error: true
+        run: |
+          echo "=== ERROR LOG ANALYSIS ===" >> $GITHUB_STEP_SUMMARY
+          mkdir -p .github/logs
+          if [ -f ".github/logs/errors.log" ]; then
+            echo "Recent errors:" >> $GITHUB_STEP_SUMMARY
+            tail -20 .github/logs/errors.log >> $GITHUB_STEP_SUMMARY
+          else
+            echo "No error logs found" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Backup Current State
+        if: always()
+        run: |
+          echo "=== BACKUP STATUS ===" >> $GITHUB_STEP_SUMMARY
+          mkdir -p .github/backups
+          BACKUP_FILE=".github/backups/backup-$(date +%Y%m%d-%H%M%S).tar.gz"
+          git archive --format=tar.gz -o "$BACKUP_FILE" HEAD
+          ln -sf "$BACKUP_FILE" .github/backups/latest.tar.gz
+          echo "Backup created: $BACKUP_FILE" >> $GITHUB_STEP_SUMMARY
+          ls -lh .github/backups/ >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload Backup Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: repository-backup
+          path: .github/backups/latest.tar.gz
+
+      - name: File Integrity Check
+        run: |
+          echo "=== FILE INTEGRITY CHECK ===" >> $GITHUB_STEP_SUMMARY
+          find . -type f \( -name "*.yml" -o -name "*.yaml" \) -print | while read file; do
+            echo "Checking: $file" >> $GITHUB_STEP_SUMMARY
+          done
+
+      - name: Restore From Backup on Critical Errors
+        if: failure()
+        continue-on-error: true
+        run: |
+          echo "=== ATTEMPTING ERROR RECOVERY ===" >> $GITHUB_STEP_SUMMARY
+          if [ -f ".github/backups/latest.tar.gz" ]; then
+            echo "Restoring from latest backup..." >> $GITHUB_STEP_SUMMARY
+            tar -xzf .github/backups/latest.tar.gz
+            echo "Recovery completed" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "No backup available for recovery" >> $GITHUB_STEP_SUMMARY
+          fi

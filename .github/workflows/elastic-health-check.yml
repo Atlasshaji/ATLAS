@@ -1,0 +1,207 @@
+name: Elastic Health Check & Auto-Repair
+
+on:
+  schedule:
+    - cron: "*/30 * * * *" # Every 30 minutes
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: write
+
+jobs:
+  elastic-health-check:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v3
+
+      - name: Elastic/OpenSearch Health Check
+        continue-on-error: true
+        run: |
+          echo "=== ELASTICSEARCH/OPENSEARCH HEALTH CHECK ===" >> $GITHUB_STEP_SUMMARY
+          
+          # Check if Elasticsearch/OpenSearch endpoints are accessible
+          if command -v curl &> /dev/null; then
+            echo "Checking Elasticsearch health endpoints..." >> $GITHUB_STEP_SUMMARY
+            
+            # Common ES endpoints
+            ES_ENDPOINTS=("localhost:9200" "elasticsearch:9200" "127.0.0.1:9200")
+            
+            for endpoint in "${ES_ENDPOINTS[@]}"; do
+              echo "Probing: $endpoint" >> $GITHUB_STEP_SUMMARY
+              if curl -s -f http://$endpoint/_cluster/health 2>/dev/null; then
+                echo "✓ $endpoint is healthy" >> $GITHUB_STEP_SUMMARY
+              else
+                echo "⚠ $endpoint unreachable or unhealthy" >> $GITHUB_STEP_SUMMARY
+              fi
+            done
+          else
+            echo "curl not available - skipping endpoint checks" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Check System Resource Limits
+        run: |
+          echo "=== SYSTEM RESOURCE CHECK ===" >> $GITHUB_STEP_SUMMARY
+          echo "- Available Memory: $(free -h | awk 'NR==2 {print $7}')" >> $GITHUB_STEP_SUMMARY
+          echo "- Disk Usage: $(df -h / | awk 'NR==2 {print $5}')" >> $GITHUB_STEP_SUMMARY
+          echo "- CPU Load: $(uptime | awk -F'load average:' '{print $2}')" >> $GITHUB_STEP_SUMMARY
+          echo "- Open File Descriptors: $(ulimit -n)" >> $GITHUB_STEP_SUMMARY
+
+      - name: Validate Configuration Files
+        run: |
+          echo "=== CONFIGURATION VALIDATION ===" >> $GITHUB_STEP_SUMMARY
+          
+          # Check for common ES/OS config files
+          if [ -f "elasticsearch.yml" ]; then
+            echo "✓ elasticsearch.yml found" >> $GITHUB_STEP_SUMMARY
+            grep -E "cluster.name|node.name|http.port" elasticsearch.yml >> $GITHUB_STEP_SUMMARY || true
+          fi
+          
+          if [ -f "opensearch.yml" ]; then
+            echo "✓ opensearch.yml found" >> $GITHUB_STEP_SUMMARY
+            grep -E "cluster.name|node.name|http.port" opensearch.yml >> $GITHUB_STEP_SUMMARY || true
+          fi
+          
+          # Check docker-compose or k8s configs
+          if [ -f "docker-compose.yml" ] || [ -f "docker-compose.yaml" ]; then
+            echo "✓ docker-compose found" >> $GITHUB_STEP_SUMMARY
+            grep -E "elasticsearch|opensearch" docker-compose.* >> $GITHUB_STEP_SUMMARY || echo "No ES/OS service in docker-compose" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Index Health Monitoring
+        continue-on-error: true
+        run: |
+          echo "=== INDEX HEALTH STATUS ===" >> $GITHUB_STEP_SUMMARY
+          
+          if curl -s http://localhost:9200/_cat/indices 2>/dev/null | head -5; then
+            echo "Indices retrieved successfully" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "Unable to retrieve indices (Elasticsearch may not be running)" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Repair Shard Allocation
+        continue-on-error: true
+        run: |
+          echo "=== SHARD ALLOCATION REPAIR ===" >> $GITHUB_STEP_SUMMARY
+          
+          # Check and fix unassigned shards
+          UNASSIGNED=$(curl -s http://localhost:9200/_cat/shards 2>/dev/null | grep UNASSIGNED | wc -l)
+          
+          if [ "$UNASSIGNED" -gt 0 ]; then
+            echo "Found $UNASSIGNED unassigned shards - attempting repair..." >> $GITHUB_STEP_SUMMARY
+            
+            # Try to reroute unassigned shards
+            curl -X POST http://localhost:9200/_cluster/reroute?retry_failed=true 2>/dev/null || true
+            
+            echo "Reroute command issued" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "No unassigned shards detected" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Cluster State Diagnostics
+        continue-on-error: true
+        run: |
+          echo "=== CLUSTER STATE ===" >> $GITHUB_STEP_SUMMARY
+          
+          if curl -s http://localhost:9200/_cluster/state?pretty 2>/dev/null | jq -r '.cluster_name, .status' 2>/dev/null; then
+            echo "Cluster state retrieved" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "Unable to fetch cluster state" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Auto-Repair Failed Indices
+        continue-on-error: true
+        run: |
+          echo "=== AUTO-REPAIR: FAILED INDICES ===" >> $GITHUB_STEP_SUMMARY
+          
+          # Get indices in RED state and attempt to close/reopen
+          RED_INDICES=$(curl -s http://localhost:9200/_cat/indices?health=red 2>/dev/null | awk '{print $3}' | tr '\n' ' ')
+          
+          if [ -n "$RED_INDICES" ]; then
+            echo "Found RED indices: $RED_INDICES" >> $GITHUB_STEP_SUMMARY
+            
+            for idx in $RED_INDICES; do
+              echo "Attempting to close and reopen index: $idx" >> $GITHUB_STEP_SUMMARY
+              curl -X POST "http://localhost:9200/$idx/_close" 2>/dev/null || true
+              sleep 2
+              curl -X POST "http://localhost:9200/$idx/_open" 2>/dev/null || true
+              echo "Processed: $idx" >> $GITHUB_STEP_SUMMARY
+            done
+          else
+            echo "No RED indices detected" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: JVM Memory Check & Tuning
+        run: |
+          echo "=== JVM MEMORY & TUNING ===" >> $GITHUB_STEP_SUMMARY
+          
+          # Check for common JVM config files
+          if [ -f "jvm.options" ]; then
+            echo "✓ jvm.options found" >> $GITHUB_STEP_SUMMARY
+            grep -E "Xms|Xmx" jvm.options >> $GITHUB_STEP_SUMMARY || true
+          fi
+          
+          # Recommend settings
+          TOTAL_MEM=$(free -h | awk 'NR==2 {print $2}')
+          echo "Total System Memory: $TOTAL_MEM" >> $GITHUB_STEP_SUMMARY
+          echo "Recommendation: Set Xms and Xmx to 50% of system memory (but not >31GB)" >> $GITHUB_STEP_SUMMARY
+
+      - name: Create Repair PR if Issues Found
+        if: failure()
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "=== CREATING AUTO-REPAIR PR ===" >> $GITHUB_STEP_SUMMARY
+          
+          git fetch origin main
+          BRANCH="elastic-auto-repair-$(date +%s)"
+          
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+          
+          # Create repair report
+          cat > .github/elastic-repair-report.md << 'EOF'
+          # Elasticsearch/OpenSearch Auto-Repair Report
+          
+          ## Issues Detected
+          - Review workflow logs for detailed diagnostics
+          - Check cluster health status
+          - Verify node connectivity
+          - Review shard allocation status
+          
+          ## Recommended Actions
+          1. Verify Elasticsearch/OpenSearch service is running
+          2. Check cluster resource availability
+          3. Review index and shard status
+          4. Ensure network connectivity between nodes
+          5. Verify JVM memory settings are appropriate
+          
+          ## Next Steps
+          - Run the elastic health check workflow manually
+          - Monitor cluster recovery progress
+          - Review logs in Actions tab
+          EOF
+          
+          git add .github/elastic-repair-report.md
+          git commit -m "chore(elastic): auto-generated repair report for cluster issues"
+          
+          git push -u origin "$BRANCH" 2>&1 || true
+          
+          echo "$GITHUB_TOKEN" | gh auth login --with-token 2>/dev/null || true
+          gh pr create --title "Elastic: Auto-Repair Report - $BRANCH" --body "Automated repair report generated due to Elasticsearch/OpenSearch health issues. See attached report and workflow logs for details." --base main --head "$BRANCH" 2>&1 || true
+          
+          echo "Repair PR creation attempted: $BRANCH" >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload Health Diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: elastic-health-diagnostics
+          path: |
+            .github/elastic-repair-report.md
+          retention-days: 30
